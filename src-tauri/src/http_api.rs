@@ -1,7 +1,7 @@
 //! Local HTTP API server.
 //!
 //! Reproduces the four routes the Electron build exposed via Hono on
-//! port 50761:
+//! port 50761, plus `/api/refresh`:
 //!
 //! | Method | Path           | Body |
 //! |--------|----------------|------|
@@ -9,6 +9,14 @@
 //! | GET    | `/remote-test` | `# remote-test\n# <timestamp>` |
 //! | GET    | `/api/list`    | `{success, data: flat_list}` JSON |
 //! | GET    | `/api/toggle?id=<id>` | `ok` / `bad id.` / `not found.` |
+//! | GET    | `/api/refresh?id=<id>` | `{success, changed, data}` / `{success: false, code, message}` JSON |
+//!
+//! Every route answers `200` even for failures; callers discriminate on
+//! the body (`success` for the JSON routes, the literal string for the
+//! text ones). That's what `/api/list` already did in the Electron
+//! build and what the shipped Alfred workflow expects, so `/api/refresh`
+//! follows suit rather than introducing a second error convention on
+//! the same port.
 //!
 //! Lifecycle:
 //!
@@ -36,6 +44,16 @@
 //! window is created at startup and only ever hidden, so the
 //! broadcast always reaches a live listener. The simpler port keeps
 //! `choice_mode` semantics centralised in one place.
+//!
+//! Refresh behaviour: unlike toggle, `/api/refresh` calls
+//! `refresh::refresh_one` directly instead of broadcasting to the
+//! renderer. The fetch + write + `last_refresh` stamp are backend-owned
+//! already — the cron scanner in refresh.rs drives exactly this path —
+//! so the handler can await the real outcome and report `changed` /
+//! `fetch_failed` back to the caller instead of a blind `ok`. Applying
+//! the new content to the system `hosts` file still happens the usual
+//! way: `refresh_one` emits `hosts_content_changed`, and List's
+//! subscriber re-applies when the node is switched on.
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Mutex;
@@ -48,6 +66,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use tauri::{AppHandle, Emitter, Manager, Wry};
 
+use crate::refresh::{self, RefreshError, RefreshOutcome};
 use crate::storage::{manifest::Manifest, AppState};
 
 // We pin the HTTP API to the default `Wry` runtime instead of staying
@@ -130,6 +149,7 @@ async fn serve(app: AppHandle<Wry>, std_listener: std::net::TcpListener) -> Resu
         .route("/remote-test", get(remote_test))
         .route("/api/list", get(api_list))
         .route("/api/toggle", get(api_toggle))
+        .route("/api/refresh", get(api_refresh))
         .with_state(AppRouterState { app });
 
     let listener = tokio::net::TcpListener::from_std(std_listener)
@@ -169,14 +189,11 @@ async fn api_list(State(state): State<AppRouterState>) -> Response {
 }
 
 #[derive(Deserialize)]
-struct ToggleQuery {
+struct IdQuery {
     id: Option<String>,
 }
 
-async fn api_toggle(
-    State(state): State<AppRouterState>,
-    Query(q): Query<ToggleQuery>,
-) -> &'static str {
+async fn api_toggle(State(state): State<AppRouterState>, Query(q): Query<IdQuery>) -> &'static str {
     let Some(id) = q.id else {
         return "bad id.";
     };
@@ -205,6 +222,64 @@ async fn api_toggle(
     // other Tauri broadcast in this codebase uses.
     let _ = state.app.emit("toggle_item", json!({ "_args": [id, !on] }));
     "ok"
+}
+
+async fn api_refresh(State(state): State<AppRouterState>, Query(q): Query<IdQuery>) -> Response {
+    let Some(id) = q.id.filter(|id| !id.is_empty()) else {
+        return Json(bad_id_value()).into_response();
+    };
+    log::info!("refresh: {id}");
+
+    let app_state = state.app.state::<AppState>();
+    // Unlike toggle — which only broadcasts and lets the renderer's
+    // apply pipeline hit the usual guards — this handler writes to the
+    // data directory itself, so it needs the same backstop the
+    // `refresh_remote_hosts` command has: refuse while the data
+    // directory is unresolved and the app is sitting on the recovery
+    // dialog.
+    if let Err(e) = app_state.require_data_dir_usable() {
+        let denied = RefreshError::Storage {
+            message: e.to_string(),
+        };
+        return Json(denied.into_renderer_value()).into_response();
+    }
+
+    let result = refresh::refresh_one(&state.app, app_state.inner(), &id).await;
+    Json(refresh_result_value(result)).into_response()
+}
+
+/// Shape a refresh outcome for the wire. Successes mirror the
+/// `refresh_remote_hosts` command's `{success, data}` and add
+/// `changed`, which the command drops — over HTTP there's no
+/// `hosts_refreshed` event to listen for, so "did anything actually
+/// move?" has to travel in the response. Failures reuse the command's
+/// `{success: false, code, message}` so both surfaces speak the same
+/// error vocabulary.
+fn refresh_result_value(result: Result<RefreshOutcome, RefreshError>) -> Value {
+    match result {
+        Ok(RefreshOutcome::Updated { node }) => json!({
+            "success": true,
+            "changed": true,
+            "data": node,
+        }),
+        Ok(RefreshOutcome::Unchanged { node }) => json!({
+            "success": true,
+            "changed": false,
+            "data": node,
+        }),
+        Err(e) => e.into_renderer_value(),
+    }
+}
+
+/// A missing / empty `id` is the caller's mistake, not a lookup miss —
+/// keep it distinct from `invalid_id` ("no such node"), the same way
+/// toggle separates `bad id.` from `not found.`.
+fn bad_id_value() -> Value {
+    json!({
+        "success": false,
+        "code": "bad_id",
+        "message": "query parameter `id` is required",
+    })
 }
 
 // ---- tree helpers ----------------------------------------------------------
@@ -336,5 +411,57 @@ mod tests {
         // Timestamp must be non-empty (the chrono format string is dynamic).
         let ts = &body["# remote-test\n# ".len()..];
         assert!(!ts.is_empty());
+    }
+
+    #[test]
+    fn refresh_result_value_distinguishes_updated_from_unchanged() {
+        let node = json!({ "id": "remote-1", "type": "remote" });
+
+        let updated = refresh_result_value(Ok(RefreshOutcome::Updated { node: node.clone() }));
+        assert_eq!(
+            updated,
+            json!({ "success": true, "changed": true, "data": node })
+        );
+
+        let unchanged = refresh_result_value(Ok(RefreshOutcome::Unchanged { node: node.clone() }));
+        assert_eq!(
+            unchanged,
+            json!({ "success": true, "changed": false, "data": node })
+        );
+    }
+
+    #[test]
+    fn refresh_result_value_passes_error_codes_through() {
+        for (err, code) in [
+            (RefreshError::InvalidId, "invalid_id"),
+            (RefreshError::NotRemote, "not_remote"),
+            (RefreshError::NoUrl, "no_url"),
+            (
+                RefreshError::Fetch {
+                    message: "HTTP 502".into(),
+                },
+                "fetch_failed",
+            ),
+        ] {
+            let v = refresh_result_value(Err(err));
+            assert_eq!(v.get("success").and_then(Value::as_bool), Some(false));
+            assert_eq!(v.get("code").and_then(Value::as_str), Some(code));
+            // The message must survive — Raycast / Alfred show it verbatim.
+            assert!(
+                v.get("message")
+                    .and_then(Value::as_str)
+                    .is_some_and(|m| !m.is_empty()),
+                "missing message for {code}: {v}"
+            );
+        }
+    }
+
+    #[test]
+    fn bad_id_value_is_not_confused_with_a_lookup_miss() {
+        let v = bad_id_value();
+        assert_eq!(v.get("success").and_then(Value::as_bool), Some(false));
+        assert_eq!(v.get("code").and_then(Value::as_str), Some("bad_id"));
+        // `invalid_id` is reserved for "the node doesn't exist".
+        assert_ne!(v.get("code").and_then(Value::as_str), Some("invalid_id"));
     }
 }

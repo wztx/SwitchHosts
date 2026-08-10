@@ -16,10 +16,26 @@
 //! seconds. We acquire the lock only for the read-modify-write of
 //! manifest.json, and *re-find* the target node by id at lock time so
 //! a concurrent renderer edit doesn't get clobbered.
+//!
+//! That leaves the fetch → compare → write sequence on the *entry*
+//! file unguarded, which two overlapping refreshes of the same node
+//! can interleave into a rollback: A fetches V1 slowly, B fetches V2
+//! and writes it, then A wakes up, sees "disk differs from what I
+//! fetched", writes V1 back, stamps a *newer* `last_refresh` and emits
+//! `hosts_content_changed` — so the system hosts file ends up on stale
+//! content while the UI reports a successful refresh. Three callers can
+//! overlap: the `refresh_remote_hosts` command, the background scanner
+//! below, and `/api/refresh` (which has no UI debounce in front of it).
+//! `refresh_one_inner` therefore serialises on a per-node mutex held
+//! across the whole sequence. Per-node rather than global: a single
+//! mutex would park an `/api/refresh` call behind an entire
+//! `refresh_all` fan-out — N nodes × up to the 30s fetch timeout.
+//! Lock order is always refresh-lock → `store_lock`, never the reverse.
 
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serde_json::{json, Value};
@@ -74,6 +90,35 @@ impl RefreshError {
     }
 }
 
+// ---- per-node serialisation ------------------------------------------------
+
+/// One mutex per node id, created on demand. `Option<HashMap>` rather
+/// than a `LazyLock` because `Mutex::new` is const while `HashMap::new`
+/// is not, and `LazyLock` would push the crate past the 1.77 MSRV
+/// declared in Cargo.toml — same shape as `http_api::SERVER`.
+static REFRESH_LOCKS: Mutex<Option<HashMap<String, Arc<tokio::sync::Mutex<()>>>>> =
+    Mutex::new(None);
+
+fn refresh_lock_for(id: &str) -> Arc<tokio::sync::Mutex<()>> {
+    let mut guard = REFRESH_LOCKS.lock().expect("refresh locks mutex poisoned");
+    lock_for_in(guard.get_or_insert_with(HashMap::new), id)
+}
+
+/// Split out from `refresh_lock_for` so the sweep below is testable
+/// against a local map — the static is shared by every test in the
+/// binary and its size can't be asserted on deterministically.
+fn lock_for_in(
+    map: &mut HashMap<String, Arc<tokio::sync::Mutex<()>>>,
+    id: &str,
+) -> Arc<tokio::sync::Mutex<()>> {
+    // `strong_count == 1` means the map itself holds the only reference,
+    // so no refresh is running or queued on that node and the entry can
+    // go. Without this, ids of deleted nodes would pin their mutex for
+    // the life of the process.
+    map.retain(|_, lock| Arc::strong_count(lock) > 1);
+    map.entry(id.to_string()).or_default().clone()
+}
+
 /// Refresh a single remote node by id.
 pub async fn refresh_one<R: Runtime>(
     app: &AppHandle<R>,
@@ -89,6 +134,14 @@ async fn refresh_one_inner<R: Runtime>(
     id: &str,
     emit_content_changed: bool,
 ) -> Result<RefreshOutcome, RefreshError> {
+    // Step 0: take this node's refresh mutex for the whole function.
+    // Everything below is a read-modify-write straddling an await, so a
+    // second refresh of the same id must queue rather than interleave —
+    // see the rollback scenario in the module docs. Different ids stay
+    // fully concurrent.
+    let node_lock = refresh_lock_for(id);
+    let _serialised = node_lock.lock().await;
+
     // Step 1: snapshot the node from the current manifest. No lock —
     // we only need to read.
     let manifest = Manifest::load(&state.paths).map_err(|e| RefreshError::Storage {
@@ -570,6 +623,61 @@ mod tests {
         assert!(!due.contains(&"remote-2".into()));
         // remote-1 (last_ms=0) is still due.
         assert!(due.contains(&"remote-1".into()));
+    }
+
+    #[test]
+    fn lock_for_in_shares_one_mutex_per_id_and_sweeps_idle_entries() {
+        let mut map = HashMap::new();
+
+        let a = lock_for_in(&mut map, "a");
+        let a_again = lock_for_in(&mut map, "a");
+        let b = lock_for_in(&mut map, "b");
+
+        assert!(
+            Arc::ptr_eq(&a, &a_again),
+            "two refreshes of one node must share a mutex, or they don't exclude each other"
+        );
+        assert!(!Arc::ptr_eq(&a, &b));
+        assert_eq!(map.len(), 2);
+
+        // "a" goes idle (e.g. its node was deleted); the next lookup
+        // must reclaim it while leaving the still-referenced "b" alone.
+        drop(a);
+        drop(a_again);
+        let _b_again = lock_for_in(&mut map, "b");
+
+        assert_eq!(map.len(), 1, "idle mutexes must not accumulate");
+        assert!(map.contains_key("b"));
+    }
+
+    #[tokio::test]
+    async fn same_node_refreshes_are_serialised() {
+        // The registry is process-wide and tests run in parallel, so use
+        // ids no other test touches.
+        let first = refresh_lock_for("serialise-test-node");
+        let second = refresh_lock_for("serialise-test-node");
+
+        let held = first.lock().await;
+        assert!(
+            second.try_lock().is_err(),
+            "a concurrent refresh of the same node must queue, not interleave"
+        );
+
+        drop(held);
+        assert!(second.try_lock().is_ok(), "the mutex must release cleanly");
+    }
+
+    #[tokio::test]
+    async fn different_nodes_refresh_concurrently() {
+        let a = refresh_lock_for("concurrent-test-a");
+        let b = refresh_lock_for("concurrent-test-b");
+
+        let _held = a.lock().await;
+
+        assert!(
+            b.try_lock().is_ok(),
+            "unrelated nodes must not block each other — that's why the lock is per-id"
+        );
     }
 
     #[test]
