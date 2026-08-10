@@ -10,21 +10,23 @@ export default defineConfig({
     viteStaticCopy({
       targets: [
         {
-          src: normalizePath(path.resolve(__dirname, 'src', 'assets', 'logoTemplate*.png')),
+          src: normalizePath(
+            path.resolve(import.meta.dirname, 'src', 'assets', 'logoTemplate*.png'),
+          ),
           dest: 'assets',
         },
       ],
     }),
   ],
   base: './',
-  root: path.join(__dirname, 'src', 'renderer'),
+  root: path.join(import.meta.dirname, 'src', 'renderer'),
   build: {
     rolldownOptions: {
       input: {
-        renderer: path.join(__dirname, 'src', 'renderer', 'index.html'),
+        renderer: path.join(import.meta.dirname, 'src', 'renderer', 'index.html'),
       },
     },
-    outDir: path.join(__dirname, 'build'),
+    outDir: path.join(import.meta.dirname, 'build'),
     minify: true,
     ssr: false,
     emptyOutDir: false,
@@ -37,13 +39,13 @@ export default defineConfig({
   resolve: {
     tsconfigPaths: true,
     alias: {
-      '@': path.resolve(__dirname, 'src'),
-      '@root': path.resolve(__dirname),
-      '@assets': path.resolve(__dirname, 'assets'),
-      '@src': path.resolve(__dirname, 'src'),
-      '@common': path.resolve(__dirname, 'src', 'common'),
-      '@renderer': path.resolve(__dirname, 'src', 'renderer'),
-      '@styles': path.resolve(__dirname, 'src', 'renderer', 'styles'),
+      '@': path.resolve(import.meta.dirname, 'src'),
+      '@root': path.resolve(import.meta.dirname),
+      '@assets': path.resolve(import.meta.dirname, 'assets'),
+      '@src': path.resolve(import.meta.dirname, 'src'),
+      '@common': path.resolve(import.meta.dirname, 'src', 'common'),
+      '@renderer': path.resolve(import.meta.dirname, 'src', 'renderer'),
+      '@styles': path.resolve(import.meta.dirname, 'src', 'renderer', 'styles'),
     },
   },
   server: {
