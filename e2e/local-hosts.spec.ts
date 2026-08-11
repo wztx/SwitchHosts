@@ -81,7 +81,7 @@ test.describe('local hosts', () => {
       .toEqual({
         localDevOn: true,
         systemHosts:
-          '127.0.0.1 localhost\n255.255.255.255 broadcasthost\n\n\n# --- SWITCHHOSTS_CONTENT_START ---\n\n127.0.0.1 dev.local\n::1 dev.local\n\n\n10.0.0.8 api.local\n# 10.0.0.9 api-shadow.local\n',
+          '127.0.0.1 localhost\n255.255.255.255 broadcasthost\n\n# --- SWITCHHOSTS_CONTENT_START ---\n\n127.0.0.1 dev.local\n::1 dev.local\n\n\n10.0.0.8 api.local\n# 10.0.0.9 api-shadow.local\n\n# --- SWITCHHOSTS_CONTENT_END ---\n',
       })
 
     const calls = await getMockCalls(page)
@@ -212,7 +212,7 @@ test.describe('local hosts', () => {
         writeMode: 'append',
         localDevOn: true,
         systemHosts:
-          '127.0.0.1 localhost\n255.255.255.255 broadcasthost\n\n\n# --- SWITCHHOSTS_CONTENT_START ---\n\n127.0.0.1 dev.local\n::1 dev.local\n\n\n10.0.0.8 api.local\n# 10.0.0.9 api-shadow.local\n',
+          '127.0.0.1 localhost\n255.255.255.255 broadcasthost\n\n# --- SWITCHHOSTS_CONTENT_START ---\n\n127.0.0.1 dev.local\n::1 dev.local\n\n\n10.0.0.8 api.local\n# 10.0.0.9 api-shadow.local\n\n# --- SWITCHHOSTS_CONTENT_END ---\n',
       })
 
     const calls = await getMockCalls(page)

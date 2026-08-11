@@ -1,6 +1,7 @@
 (() => {
   const clone = (value) => JSON.parse(JSON.stringify(value))
   const contentStartMarker = '# --- SWITCHHOSTS_CONTENT_START ---'
+  const contentEndMarker = '# --- SWITCHHOSTS_CONTENT_END ---'
 
   const normalizeLineEndings = (value) => value.replace(/\r\n/g, '\n').replace(/\r/g, '\n')
 
@@ -219,16 +220,53 @@
       .filter(Boolean)
       .join('\n\n')
 
+  // Mirrors `make_append_content` in src-tauri/src/hosts_apply/write.rs:
+  // the managed section sits between the START/END markers; content after
+  // END (added by other tools) is preserved. A section without END (legacy
+  // format) owns everything from START to EOF and gains END on rewrite.
+  // Markers only count on their own line; an empty anchor is kept when a
+  // tail exists so the section's position stays stable.
+  const isMarkerLine = (line) => {
+    const trimmed = line.trim()
+    return trimmed === contentStartMarker || trimmed === contentEndMarker
+  }
+
   const makeAppendContent = (previousContent, nextContent) => {
     const previousLf = normalizeLineEndings(previousContent)
     const nextLf = normalizeLineEndings(nextContent)
-    const markerIndex = previousLf.indexOf(contentStartMarker)
-    const head =
-      markerIndex >= 0 ? previousLf.slice(0, markerIndex).trimEnd() : previousLf
 
-    if (!nextLf) return `${head}\n`
+    let head = previousLf
+    let tail = ''
+    const previousLines = previousLf.split('\n')
+    const startIndex = previousLines.findIndex(
+      (line) => line.trim() === contentStartMarker,
+    )
+    if (startIndex >= 0) {
+      head = previousLines.slice(0, startIndex).join('\n')
+      const endOffset = previousLines
+        .slice(startIndex + 1)
+        .findIndex((line) => line.trim() === contentEndMarker)
+      tail =
+        endOffset >= 0
+          ? previousLines.slice(startIndex + 1 + endOffset + 1).join('\n')
+          : ''
+    }
+    head = head.trimEnd()
+    tail = tail.trim()
 
-    return `${head}\n\n${contentStartMarker}\n\n${nextLf}`
+    const content = nextLf
+      .split('\n')
+      .filter((line) => !isMarkerLine(line))
+      .join('\n')
+      .trim()
+
+    const parts = []
+    if (head) parts.push(head)
+    if (content) parts.push(`${contentStartMarker}\n\n${content}\n\n${contentEndMarker}`)
+    else if (tail) parts.push(`${contentStartMarker}\n\n${contentEndMarker}`)
+    if (tail) parts.push(tail)
+
+    return `${parts.join('\n\n')}\n`
   }
 
   const refreshRemote = (id) => {

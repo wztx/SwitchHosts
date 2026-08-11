@@ -4,9 +4,13 @@
 //! [src/main/actions/hosts/setSystemHosts.ts]:
 //!
 //! 1. Normalize line endings to LF in memory.
-//! 2. If `write_mode == "append"`, splice the new content under the
-//!    `# --- SWITCHHOSTS_CONTENT_START ---` marker, dropping anything
-//!    that was previously below it.
+//! 2. If `write_mode == "append"`, splice the new content into the
+//!    section delimited by the `# --- SWITCHHOSTS_CONTENT_START ---` /
+//!    `# --- SWITCHHOSTS_CONTENT_END ---` markers, preserving whatever
+//!    other tools appended after the END marker. Legacy files written
+//!    before the END marker existed are treated as owning everything
+//!    from START to EOF (the pre-END behaviour) and gain the END marker
+//!    on rewrite.
 //! 3. Convert to platform-native line endings for the on-disk content.
 //! 4. Read the current system hosts file. If the new payload is
 //!    byte-identical (compared via stable hash), short-circuit with
@@ -25,6 +29,7 @@ use super::elevation::write_privileged;
 use super::error::HostsApplyError;
 
 const CONTENT_START_MARKER: &str = "# --- SWITCHHOSTS_CONTENT_START ---";
+const CONTENT_END_MARKER: &str = "# --- SWITCHHOSTS_CONTENT_END ---";
 
 #[cfg(not(target_os = "windows"))]
 const UNIX_SYSTEM_HOSTS_PATH: &str = "/etc/hosts";
@@ -184,17 +189,110 @@ fn restore_line_endings(s: &str) -> String {
 
 // ---- append-mode helper ----------------------------------------------------
 
+/// Rebuild the hosts file around the SwitchHosts-managed section.
+///
+/// Layout: `head` (everything before START, untouched) + the managed
+/// section wrapped in START/END markers + `tail` (everything after END,
+/// untouched). Preserving the tail is what keeps entries other tools
+/// append to the end of the file alive across re-applies.
+///
+/// When the aggregated content is empty but a tail exists, an empty
+/// START/END anchor is kept in place: dropping it would make the next
+/// non-empty apply re-create the section *after* the tail, silently
+/// reordering entries (hosts resolution is first-match-wins).
+///
+/// The seams are normalised (head trimmed at its end, tail at both
+/// ends, fixed blank lines around the markers) so that re-applying the
+/// same content is byte-identical — the caller's hash short-circuit
+/// depends on that to avoid needless privileged writes.
 fn make_append_content(previous_lf: &str, new_content_lf: &str) -> String {
-    let head = match previous_lf.find(CONTENT_START_MARKER) {
-        Some(idx) => previous_lf[..idx].trim_end().to_string(),
-        None => previous_lf.to_string(),
-    };
+    let (head, tail) = split_around_managed_section(previous_lf);
+    let head = head.trim_end();
+    let tail = tail.trim();
+    let content = strip_marker_lines(new_content_lf);
+    let content = content.trim();
 
-    if new_content_lf.is_empty() {
-        return format!("{head}\n");
+    let mut parts: Vec<String> = Vec::new();
+    if !head.is_empty() {
+        parts.push(head.to_string());
+    }
+    if !content.is_empty() {
+        parts.push(format!(
+            "{CONTENT_START_MARKER}\n\n{content}\n\n{CONTENT_END_MARKER}"
+        ));
+    } else if !tail.is_empty() {
+        parts.push(format!("{CONTENT_START_MARKER}\n\n{CONTENT_END_MARKER}"));
+    }
+    if !tail.is_empty() {
+        parts.push(tail.to_string());
     }
 
-    format!("{head}\n\n{CONTENT_START_MARKER}\n\n{new_content_lf}")
+    let mut result = parts.join("\n\n");
+    result.push('\n');
+    result
+}
+
+/// True when `line` is a section boundary. Markers only count as
+/// boundaries on their own line (modulo surrounding whitespace) — a
+/// marker quoted inside a hosts entry's inline comment is content, not
+/// a boundary. Every SwitchHosts version has written markers on their
+/// own line, so this stays backward-compatible.
+fn is_marker_line(line: &str) -> bool {
+    let trimmed = line.trim();
+    trimmed == CONTENT_START_MARKER || trimmed == CONTENT_END_MARKER
+}
+
+/// Split the previous hosts content into (head, tail) around the
+/// SwitchHosts-managed section.
+///
+/// The END marker is only searched for *after* the START marker, so a
+/// stray END sitting before START stays part of the head and is never
+/// touched. When no END follows START (files written by versions that
+/// predate the END marker), the tail is empty: everything from START to
+/// EOF is considered SwitchHosts-owned, matching the legacy behaviour.
+fn split_around_managed_section(previous_lf: &str) -> (&str, &str) {
+    let Some((start_begin, start_end)) = find_marker_line(previous_lf, 0, CONTENT_START_MARKER)
+    else {
+        return (previous_lf, "");
+    };
+
+    let head = &previous_lf[..start_begin];
+
+    match find_marker_line(previous_lf, start_end, CONTENT_END_MARKER) {
+        Some((_, end_end)) => (head, &previous_lf[end_end..]),
+        None => (head, ""),
+    }
+}
+
+/// Find the first line at or after byte offset `from` whose trimmed
+/// content equals `marker`. Returns the line's `(start, end)` byte
+/// offsets, `end` excluding the trailing newline.
+fn find_marker_line(text: &str, from: usize, marker: &str) -> Option<(usize, usize)> {
+    let mut line_start = from;
+    for segment in text[from..].split_inclusive('\n') {
+        let line = segment.strip_suffix('\n').unwrap_or(segment);
+        if line.trim() == marker {
+            return Some((line_start, line_start + line.len()));
+        }
+        line_start += segment.len();
+    }
+    None
+}
+
+/// Drop aggregated-content lines that *are* a marker line: left in,
+/// such a line would make the next parse end the managed section early
+/// and leak the remainder into the preserved tail forever. Lines merely
+/// containing a marker substring are kept — they are not boundaries.
+fn strip_marker_lines(content_lf: &str) -> String {
+    if !content_lf.lines().any(is_marker_line) {
+        return content_lf.to_string();
+    }
+
+    content_lf
+        .lines()
+        .filter(|line| !is_marker_line(line))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 // ---- comparison hash --------------------------------------------------------
@@ -212,7 +310,39 @@ fn hash_str(s: &str) -> u64 {
 mod tests {
     use std::path::Path;
 
-    use super::windows_hosts_path_from_windows_dir;
+    use super::{make_append_content, windows_hosts_path_from_windows_dir};
+
+    /// Behaviour cases live in a fixture shared with the Playwright
+    /// Tauri mock, which reimplements this function in JavaScript. Both
+    /// implementations are asserted against the same file so they cannot
+    /// drift apart silently; see the `$comment` in the fixture.
+    const CASES_JSON: &str = include_str!("../../../test/fixtures/hosts_append_cases.json");
+
+    #[test]
+    fn append_mode_matches_shared_behaviour_fixture() {
+        let doc: serde_json::Value =
+            serde_json::from_str(CASES_JSON).expect("fixture is valid JSON");
+        let cases = doc["cases"]
+            .as_array()
+            .expect("fixture has a `cases` array");
+        assert!(!cases.is_empty(), "fixture must define at least one case");
+
+        for case in cases {
+            let name = case["name"].as_str().expect("case has a name");
+            let mut content = case["previous"]
+                .as_str()
+                .expect("case has `previous`")
+                .to_string();
+
+            for payload in case["applies"].as_array().expect("case has `applies`") {
+                let payload = payload.as_str().expect("`applies` holds strings");
+                content = make_append_content(&content, payload);
+            }
+
+            let expected = case["expected"].as_str().expect("case has `expected`");
+            assert_eq!(content, expected, "fixture case `{name}` failed");
+        }
+    }
 
     #[test]
     fn windows_hosts_path_uses_resolved_windows_directory() {
