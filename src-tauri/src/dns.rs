@@ -10,6 +10,8 @@ use std::net::Ipv4Addr;
 
 use serde::Deserialize;
 
+use crate::http;
+
 #[derive(Debug, Clone)]
 pub struct DohProvider {
     /// config id, e.g. "alidns"
@@ -220,6 +222,33 @@ pub fn build_domain_hosts_content(
     lines.join("\n") + "\n"
 }
 
+/// Resolve `domain` via the provider's DoH JSON endpoint. `client`
+/// should come from `http::build_client` so proxy / UA / timeout stay
+/// consistent with the remote-hosts fetch path.
+pub async fn resolve_domain(
+    client: &reqwest::Client,
+    provider: &DohProvider,
+    domain: &str,
+) -> Result<Vec<Ipv4Addr>, DnsError> {
+    let url = provider.template.replace("{domain}", domain);
+    let mut req = client.get(&url);
+    if provider.json_header {
+        req = req.header("Accept", "application/dns-json");
+    }
+    let response = req
+        .send()
+        .await
+        .map_err(|e| DnsError::Network(e.to_string()))?;
+    let status = response.status();
+    if !status.is_success() {
+        return Err(DnsError::Network(format!("HTTP {}", status.as_u16())));
+    }
+    let body = http::response_text_with_limit(response, MAX_DOH_BYTES)
+        .await
+        .map_err(DnsError::Network)?;
+    parse_doh_a_records(&body)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -369,5 +398,45 @@ mod tests {
              # Alternate addresses:\n\
              # 20.205.243.166 github.com\n"
         );
+    }
+
+    #[tokio::test]
+    async fn resolve_domain_queries_template_and_parses_answer() {
+        use std::collections::HashMap;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = axum::Router::new().route(
+            "/resolve",
+            axum::routing::get(
+                |axum::extract::Query(params): axum::extract::Query<HashMap<String, String>>| async move {
+                    if params.get("name").map(String::as_str) == Some("example.com") {
+                        axum::Json(serde_json::json!({
+                            "Status": 0,
+                            "Answer": [
+                                {"name": "example.com.", "type": 1, "TTL": 60, "data": "93.184.216.34"}
+                            ]
+                        }))
+                    } else {
+                        axum::Json(serde_json::json!({"Status": 0, "Answer": []}))
+                    }
+                },
+            ),
+        );
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let client = reqwest::Client::new();
+        let template = format!("http://{addr}/resolve?name={{domain}}&type=A");
+        let provider = provider_by_id("custom", &template).unwrap();
+        let ips = resolve_domain(&client, &provider, "example.com").await.unwrap();
+        assert_eq!(ips, vec![ip("93.184.216.34")]);
+
+        // 模板没有把 name 传成服务端期望的值 → 空 Answer → NoARecord
+        assert!(matches!(
+            resolve_domain(&client, &provider, "other.com").await,
+            Err(DnsError::NoARecord)
+        ));
     }
 }
