@@ -249,3 +249,21 @@ export const isValidDomain = (s: string): boolean => {
   if (/^\d{1,3}(\.\d{1,3}){3}$/.test(v)) return false
   return true
 }
+
+// Extract a bare domain from user input: accepts a bare domain or a
+// pasted URL (with scheme / path / port / userinfo / trailing dot) and
+// returns its hostname. Returns null when no valid domain can be
+// extracted.
+export const extractDomain = (input: string): string | null => {
+  const v = input.trim()
+  if (!v) return null
+  if (isValidDomain(v)) return v
+
+  const scheme = v.match(/^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//)
+  let rest = scheme ? v.slice(scheme[0].length) : v
+  rest = rest.split(/[/?#]/)[0]
+  rest = rest.split('@').pop() || ''
+  rest = rest.split(':')[0]
+  if (rest.endsWith('.')) rest = rest.slice(0, -1)
+  return isValidDomain(rest) ? rest : null
+}

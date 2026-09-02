@@ -62,10 +62,12 @@ const EditHostsInfo = () => {
     })
 
     if (data.type === 'remote' && (data.source as string) === 'domain') {
-      if (!hostsFn.isValidDomain(String(data.url || ''))) {
+      const domain = hostsFn.extractDomain(String(data.url || ''))
+      if (!domain) {
         setDomainError(i18n.trans('invalid_domain', [data.url || '']))
         return
       }
+      data.url = domain
     }
     setDomainError('')
 

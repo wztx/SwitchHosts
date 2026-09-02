@@ -178,4 +178,18 @@ describe('EditHostsInfo domain source', () => {
     await screen.findByDisplayValue('https://example.com/hosts')
     expect(screen.queryByText(/Will be resolved/i)).toBeNull()
   })
+
+  it('normalizes a pasted URL to its bare domain on save', async () => {
+    mocks.hostsData.list = [
+      { id: 'd2', type: 'remote', source: 'domain', title: 'DBLP', url: 'https://dblp.org/' },
+    ]
+    openDialog(mocks.hostsData.list[0])
+    await screen.findByDisplayValue('https://dblp.org/')
+    fireEvent.click(screen.getByRole('button', { name: 'OK' }))
+    await waitFor(() => {
+      expect(mocks.setList).toHaveBeenCalled()
+    })
+    const saved = mocks.setList.mock.calls[0][0] as any[]
+    expect(saved[0].url).toBe('dblp.org')
+  })
 })
