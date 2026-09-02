@@ -6,6 +6,10 @@
 //! Query/response handling follows the Google JSON DoH shape
 //! (`Status`, `Answer[].type == 1` for A records).
 
+use std::net::Ipv4Addr;
+
+use serde::Deserialize;
+
 #[derive(Debug, Clone)]
 pub struct DohProvider {
     /// config id, e.g. "alidns"
@@ -156,6 +160,66 @@ pub fn is_valid_domain(s: &str) -> bool {
     true
 }
 
+pub const MAX_DOH_BYTES: usize = 64 * 1024;
+
+#[derive(Deserialize)]
+struct DohAnswer {
+    #[serde(rename = "type")]
+    rtype: u16,
+    data: String,
+}
+
+#[derive(Deserialize)]
+struct DohResponse {
+    #[serde(rename = "Status", default)]
+    status: i64,
+    #[serde(rename = "Answer", default)]
+    answer: Vec<DohAnswer>,
+}
+
+/// Parse a Google-style DoH JSON body and return IPv4 A records in
+/// answer order. `Status != 0`, no A records, or malformed JSON are
+/// all errors (no silent fallback).
+pub fn parse_doh_a_records(body: &str) -> Result<Vec<Ipv4Addr>, DnsError> {
+    let resp: DohResponse =
+        serde_json::from_str(body).map_err(|e| DnsError::Parse(e.to_string()))?;
+    if resp.status != 0 {
+        return Err(DnsError::BadStatus(resp.status));
+    }
+    let ips: Vec<Ipv4Addr> = resp
+        .answer
+        .iter()
+        .filter(|a| a.rtype == 1)
+        .filter_map(|a| a.data.parse::<Ipv4Addr>().ok())
+        .collect();
+    if ips.is_empty() {
+        return Err(DnsError::NoARecord);
+    }
+    Ok(ips)
+}
+
+/// Build the hosts content for a domain-sourced remote entry. First IP
+/// is the active line; the rest are commented alternates. The whole
+/// content is rebuilt on every refresh (never appended).
+pub fn build_domain_hosts_content(
+    domain: &str,
+    ips: &[Ipv4Addr],
+    provider_label: &str,
+    ts: &str,
+) -> String {
+    let mut lines = Vec::with_capacity(ips.len() + 3);
+    lines.push(format!("# Source: domain {domain}"));
+    lines.push(format!("# Resolved via {provider_label} at {ts}"));
+    lines.push(format!("{} {}", ips[0], domain));
+    if ips.len() > 1 {
+        lines.push("# Alternate addresses:".to_string());
+        for ip in &ips[1..] {
+            lines.push(format!("# {ip} {domain}"));
+        }
+    }
+    lines.join("\n") + "\n"
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -227,5 +291,83 @@ mod tests {
         assert!(is_known_provider_id("alidns"));
         assert!(is_known_provider_id("custom"));
         assert!(!is_known_provider_id("bogus"));
+    }
+
+    use std::net::Ipv4Addr;
+
+    fn ip(s: &str) -> Ipv4Addr {
+        s.parse().unwrap()
+    }
+
+    #[test]
+    fn parse_doh_a_records_filters_type_1_only() {
+        let body = r#"{
+            "Status": 0,
+            "Answer": [
+                {"name": "example.com.", "type": 1, "TTL": 60, "data": "93.184.216.34"},
+                {"name": "example.com.", "type": 5, "TTL": 60, "data": "ns1.example.com"},
+                {"name": "example.com.", "type": 28, "TTL": 60, "data": "2606:2800:220:1:1:1:1:1"},
+                {"name": "example.com.", "type": 1, "TTL": 60, "data": "93.184.216.35"}
+            ]
+        }"#;
+        let ips = parse_doh_a_records(body).unwrap();
+        assert_eq!(ips, vec![ip("93.184.216.34"), ip("93.184.216.35")]);
+    }
+
+    #[test]
+    fn parse_doh_a_records_error_paths() {
+        assert!(matches!(
+            parse_doh_a_records(r#"{"Status":3,"Answer":[]}"#),
+            Err(DnsError::BadStatus(3))
+        ));
+        assert!(matches!(
+            parse_doh_a_records(r#"{"Status":0,"Answer":[]}"#),
+            Err(DnsError::NoARecord)
+        ));
+        assert!(matches!(
+            parse_doh_a_records("not json"),
+            Err(DnsError::Parse(_))
+        ));
+        // Answer 里全是非 A 记录 → NoARecord
+        assert!(matches!(
+            parse_doh_a_records(r#"{"Status":0,"Answer":[{"name":"x.","type":5,"data":"y"}]}"#),
+            Err(DnsError::NoARecord)
+        ));
+    }
+
+    #[test]
+    fn build_content_single_ip_golden() {
+        let ips = [ip("140.82.112.3")];
+        let out = build_domain_hosts_content(
+            "github.com",
+            &ips,
+            "Ali DoH (223.5.5.5)",
+            "2026-09-02 14:30",
+        );
+        assert_eq!(
+            out,
+            "# Source: domain github.com\n\
+             # Resolved via Ali DoH (223.5.5.5) at 2026-09-02 14:30\n\
+             140.82.112.3 github.com\n"
+        );
+    }
+
+    #[test]
+    fn build_content_multi_ip_golden() {
+        let ips = [ip("140.82.112.3"), ip("20.205.243.166")];
+        let out = build_domain_hosts_content(
+            "github.com",
+            &ips,
+            "Ali DoH (223.5.5.5)",
+            "2026-09-02 14:30",
+        );
+        assert_eq!(
+            out,
+            "# Source: domain github.com\n\
+             # Resolved via Ali DoH (223.5.5.5) at 2026-09-02 14:30\n\
+             140.82.112.3 github.com\n\
+             # Alternate addresses:\n\
+             # 20.205.243.166 github.com\n"
+        );
     }
 }
