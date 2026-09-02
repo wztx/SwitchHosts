@@ -4,8 +4,19 @@
  */
 
 import { ConfigsType, ThemeType } from '@common/default_configs'
+import { DNS_PROVIDERS } from '@common/dns'
 import { LocaleName } from '@common/i18n'
-import { Box, Button, Checkbox, Group, SegmentedControl, Select, Stack, Text } from '@mantine/core'
+import {
+  Box,
+  Button,
+  Checkbox,
+  Group,
+  SegmentedControl,
+  Select,
+  Stack,
+  Text,
+  TextInput,
+} from '@mantine/core'
 import DescriptionText, { checkboxDescriptionStyles } from '@renderer/components/DescriptionText'
 import { actions, agent } from '@renderer/core/agent'
 import useI18n from '@renderer/models/useI18n'
@@ -168,6 +179,38 @@ const General = (props: IProps) => {
           <DescriptionText style={{ alignSelf: 'stretch' }}>
             {lang.choice_mode_desc}
           </DescriptionText>
+        </Stack>
+
+        <Box style={segmentedControlLabelStyle}>{lang.dns_provider}</Box>
+        <Stack gap="8px" align="flex-start">
+          <Select
+            value={data.dns_provider || 'alidns'}
+            onChange={(v) => v && onChange({ dns_provider: v })}
+            data={DNS_PROVIDERS.map((p) => ({
+              value: p.value,
+              label: p.value === 'custom' ? lang.dns_provider_custom : p.label,
+            }))}
+            w={200}
+            allowDeselect={false}
+          />
+          <DescriptionText style={{ alignSelf: 'stretch' }}>
+            {lang.dns_provider_desc}
+          </DescriptionText>
+          {data.dns_provider === 'custom' ? (
+            <TextInput
+              w="100%"
+              label={lang.dns_custom_url}
+              description={lang.dns_custom_url_desc}
+              placeholder="https://doh.example.com/resolve?name={domain}&type=A"
+              value={data.dns_custom_url || ''}
+              onChange={(e) => onChange({ dns_custom_url: e.target.value })}
+              error={
+                data.dns_custom_url && !data.dns_custom_url.includes('{domain}')
+                  ? lang.dns_custom_url_invalid
+                  : undefined
+              }
+            />
+          ) : null}
         </Stack>
       </Box>
 
