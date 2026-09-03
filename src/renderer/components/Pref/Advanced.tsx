@@ -5,7 +5,8 @@
 
 import { httpApiPort } from '@common/constants'
 import { ConfigsType } from '@common/default_configs'
-import { Box, Button, Checkbox, Group, Stack, Tooltip } from '@mantine/core'
+import { DNS_PROVIDERS } from '@common/dns'
+import { Box, Button, Checkbox, Group, Select, Stack, TextInput, Tooltip } from '@mantine/core'
 import ConfirmModal from '@renderer/components/ConfirmModal'
 import DescriptionText, { checkboxDescriptionStyles } from '@renderer/components/DescriptionText'
 import ChangeDataDirModal from '@renderer/components/Pref/ChangeDataDirModal'
@@ -189,6 +190,38 @@ const Advanced = (props: IProps) => {
           </Stack>
         </Box>
       </Stack>
+
+      <div style={{ width: '100%' }}>
+        <div>{lang.dns_provider}</div>
+        <DescriptionText mb="8px">{lang.dns_provider_desc}</DescriptionText>
+        <Stack gap="8px" align="flex-start">
+          <Select
+            value={data.dns_provider || 'alidns'}
+            onChange={(v) => v && onChange({ dns_provider: v })}
+            data={DNS_PROVIDERS.map((p) => ({
+              value: p.value,
+              label: p.value === 'custom' ? lang.dns_provider_custom : p.label,
+            }))}
+            w={200}
+            allowDeselect={false}
+          />
+          {data.dns_provider === 'custom' ? (
+            <TextInput
+              w="100%"
+              label={lang.dns_custom_url}
+              description={lang.dns_custom_url_desc}
+              placeholder="https://doh.example.com/resolve?name={domain}&type=A"
+              value={data.dns_custom_url || ''}
+              onChange={(e) => onChange({ dns_custom_url: e.target.value })}
+              error={
+                data.dns_custom_url && !data.dns_custom_url.includes('{domain}')
+                  ? lang.dns_custom_url_invalid
+                  : undefined
+              }
+            />
+          ) : null}
+        </Stack>
+      </div>
 
       <div style={{ width: '100%' }}>
         <div>{lang.usage_data_title}</div>
