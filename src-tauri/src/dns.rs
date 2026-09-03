@@ -4,7 +4,8 @@
 //! The DoH endpoints in the builtin registry are IP-literal so the
 //! resolver itself never needs a DNS lookup (no bootstrap problem).
 //! Query/response handling follows the Google JSON DoH shape
-//! (`Status`, `Answer[].type == 1` for A records).
+//! (`Status`, `Answer[].type == 1` for A records). Only IPv4 A records
+//! are used; an IPv6-only domain resolves to `DnsError::NoARecord`.
 
 use std::net::Ipv4Addr;
 
@@ -203,15 +204,16 @@ pub fn parse_doh_a_records(body: &str) -> Result<Vec<Ipv4Addr>, DnsError> {
 /// Build the hosts content for a domain-sourced remote entry. First IP
 /// is the active line; the rest are commented alternates. The whole
 /// content is rebuilt on every refresh (never appended).
-pub fn build_domain_hosts_content(
-    domain: &str,
-    ips: &[Ipv4Addr],
-    provider_label: &str,
-    ts: &str,
-) -> String {
+///
+/// Deliberately timestamp-free: `refresh_one_inner` decides "changed"
+/// by comparing the whole file, so a resolve-time line would make
+/// every refresh look like an update and rewrite the system hosts
+/// even when the IP is unchanged. The refresh time is already
+/// recorded on the node as `last_refresh`.
+pub fn build_domain_hosts_content(domain: &str, ips: &[Ipv4Addr], provider_label: &str) -> String {
     let mut lines = Vec::with_capacity(ips.len() + 3);
     lines.push(format!("# Source: domain {domain}"));
-    lines.push(format!("# Resolved via {provider_label} at {ts}"));
+    lines.push(format!("# Resolved via {provider_label}"));
     lines.push(format!("{} {}", ips[0], domain));
     if ips.len() > 1 {
         lines.push("# Alternate addresses:".to_string());
@@ -367,16 +369,11 @@ mod tests {
     #[test]
     fn build_content_single_ip_golden() {
         let ips = [ip("140.82.112.3")];
-        let out = build_domain_hosts_content(
-            "github.com",
-            &ips,
-            "Ali DoH (223.5.5.5)",
-            "2026-09-02 14:30",
-        );
+        let out = build_domain_hosts_content("github.com", &ips, "Ali DoH (223.5.5.5)");
         assert_eq!(
             out,
             "# Source: domain github.com\n\
-             # Resolved via Ali DoH (223.5.5.5) at 2026-09-02 14:30\n\
+             # Resolved via Ali DoH (223.5.5.5)\n\
              140.82.112.3 github.com\n"
         );
     }
@@ -384,16 +381,11 @@ mod tests {
     #[test]
     fn build_content_multi_ip_golden() {
         let ips = [ip("140.82.112.3"), ip("20.205.243.166")];
-        let out = build_domain_hosts_content(
-            "github.com",
-            &ips,
-            "Ali DoH (223.5.5.5)",
-            "2026-09-02 14:30",
-        );
+        let out = build_domain_hosts_content("github.com", &ips, "Ali DoH (223.5.5.5)");
         assert_eq!(
             out,
             "# Source: domain github.com\n\
-             # Resolved via Ali DoH (223.5.5.5) at 2026-09-02 14:30\n\
+             # Resolved via Ali DoH (223.5.5.5)\n\
              140.82.112.3 github.com\n\
              # Alternate addresses:\n\
              # 20.205.243.166 github.com\n"

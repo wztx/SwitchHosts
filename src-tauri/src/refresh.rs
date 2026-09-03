@@ -329,12 +329,10 @@ async fn resolve_domain_content(state: &AppState, domain: &str) -> Result<String
         .map_err(|e| RefreshError::Fetch {
             message: e.to_string(),
         })?;
-    let ts = chrono::Utc::now().format("%Y-%m-%d %H:%M").to_string();
     Ok(crate::dns::build_domain_hosts_content(
         domain,
         &ips,
         &provider.label,
-        &ts,
     ))
 }
 
