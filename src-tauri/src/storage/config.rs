@@ -59,6 +59,10 @@ pub struct AppConfig {
     pub proxy_host: String,
     pub proxy_port: u32,
 
+    // domain dns resolve
+    pub dns_provider: String, // "alidns" | "dnspod" | "cloudflare" | "google" | "custom"
+    pub dns_custom_url: String,
+
     // remote hosts refresh
     pub refresh_remote_hosts_on_startup: bool,
 
@@ -104,6 +108,9 @@ impl Default for AppConfig {
             proxy_protocol: "http".to_string(),
             proxy_host: String::new(),
             proxy_port: 0,
+
+            dns_provider: "alidns".to_string(),
+            dns_custom_url: String::new(),
 
             refresh_remote_hosts_on_startup: false,
 
@@ -301,6 +308,26 @@ mod tests {
             .unwrap();
 
         assert!(cfg.lightweight_mode);
+    }
+
+    #[test]
+    fn dns_config_fields_default_and_roundtrip() {
+        let cfg = AppConfig::default();
+        assert_eq!(cfg.dns_provider, "alidns");
+        assert_eq!(cfg.dns_custom_url, "");
+
+        let mut cfg = AppConfig::default();
+        cfg.apply_partial(&json!({
+            "dns_provider": "google",
+            "dns_custom_url": "https://doh.example.com/resolve?name={domain}&type=A"
+        }))
+        .unwrap();
+        assert_eq!(cfg.dns_provider, "google");
+        assert!(cfg.dns_custom_url.contains("{domain}"));
+
+        // 序列化往返保留字段（渲染器契约）
+        let v = serde_json::to_value(&cfg).unwrap();
+        assert_eq!(v["dns_provider"], "google");
     }
 
     #[test]

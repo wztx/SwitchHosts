@@ -4,6 +4,7 @@
  */
 
 import { FolderModeType, HostsType, IHostsListObject } from '@common/data'
+import { dnsProviderLabel } from '@common/dns'
 import events from '@common/events'
 import * as hostsFn from '@common/hostsFn'
 import {
@@ -29,13 +30,18 @@ import React, { useState } from 'react'
 import { BiEdit, BiTrash } from 'react-icons/bi'
 import { v4 as uuidv4 } from 'uuid'
 import useHostsData from '../models/useHostsData'
+import useConfigs from '../models/useConfigs'
 import useI18n from '../models/useI18n'
 import styles from './EditHostsInfo.module.scss'
 
 const EditHostsInfo = () => {
-  const { lang } = useI18n()
+  const { lang, i18n } = useI18n()
   const [hosts, setHosts] = useState<IHostsListObject | null>(null)
   const { hostsData, setList, currentHosts, setCurrentHosts } = useHostsData()
+  const { configs } = useConfigs()
+  const [domainError, setDomainError] = useState('')
+
+  const source = (hosts?.source as 'url' | 'domain') || 'url'
   const [isShow, setIsShow] = useState(false)
   const [isAdd, setIsAdd] = useState(true)
   const [isRefreshing, setIsRefreshing] = useState(false)
@@ -55,6 +61,16 @@ const EditHostsInfo = () => {
       }
     })
 
+    if (data.type === 'remote' && (data.source as string) === 'domain') {
+      const domain = hostsFn.extractDomain(String(data.url || ''))
+      if (!domain) {
+        setDomainError(i18n.trans('invalid_domain', [data.url || '']))
+        return
+      }
+      data.url = domain
+    }
+    setDomainError('')
+
     if (isAdd) {
       const h: IHostsListObject = {
         ...data,
@@ -63,14 +79,30 @@ const EditHostsInfo = () => {
       const list: IHostsListObject[] = [...hostsData.list, h]
       await setList(list)
       agent.broadcast(events.select_hosts, h.id, 1000)
+      if (data.type === 'remote' && (data.source as string) === 'domain') {
+        actions.refreshHosts(h.id).catch((e) => console.error(e))
+      }
     } else if (data && data.id) {
       const h: IHostsListObject | undefined = hostsFn.findItemById(hostsData.list, data.id)
       if (h) {
+        const prevSource = h.source || 'url'
+        const prevUrl = h.url || ''
         Object.assign(h, data)
         await setList([...hostsData.list])
 
         if (data.id === currentHosts?.id) {
           setCurrentHosts(h)
+        }
+
+        // Switching to (or retargeting) a domain source leaves the old
+        // content on disk until the next scheduled refresh; kick one off
+        // now so the entry reflects the new domain immediately.
+        if (
+          data.type === 'remote' &&
+          (data.source as string) === 'domain' &&
+          (prevSource !== 'domain' || prevUrl !== data.url)
+        ) {
+          actions.refreshHosts(h.id).catch((e) => console.error(e))
         }
       } else {
         setIsAdd(true)
@@ -115,14 +147,32 @@ const EditHostsInfo = () => {
     return (
       <>
         <Box className={styles.ln}>
-          <Text mb="8px">URL</Text>
+          <Text mb="8px">{lang.source_type}</Text>
+          <SegmentedControl
+            value={source}
+            onChange={(v) => onUpdate({ source: v as 'url' | 'domain' })}
+            data={[
+              { value: 'url', label: lang.source_url },
+              { value: 'domain', label: lang.source_domain },
+            ]}
+          />
+        </Box>
+
+        <Box className={styles.ln}>
+          <Text mb="8px">{source === 'domain' ? lang.source_domain : 'URL'}</Text>
           <TextInput
-            aria-label="URL"
+            aria-label={source === 'domain' ? lang.source_domain : 'URL'}
             value={hosts?.url || ''}
             onChange={(e: React.ChangeEvent<HTMLInputElement>) => onUpdate({ url: e.target.value })}
-            placeholder={lang.url_placeholder}
+            placeholder={source === 'domain' ? lang.domain_placeholder : lang.url_placeholder}
             onKeyDown={(e: React.KeyboardEvent<HTMLInputElement>) => e.key === 'Enter' && onSave()}
+            error={source === 'domain' && domainError ? domainError : undefined}
           />
+          {source === 'domain' ? (
+            <Text size="xs" c="dimmed" mt="4px">
+              {i18n.trans('domain_hint', [dnsProviderLabel(configs?.dns_provider)])}
+            </Text>
+          ) : null}
         </Box>
 
         <Box className={styles.ln}>
@@ -237,9 +287,7 @@ const EditHostsInfo = () => {
             { value: '2', label: lang.choice_mode_multiple },
           ]}
         />
-        <DescriptionText mt="8px">
-          {choiceModeEffect[folderMode]}
-        </DescriptionText>
+        <DescriptionText mt="8px">{choiceModeEffect[folderMode]}</DescriptionText>
       </Box>
     )
   }

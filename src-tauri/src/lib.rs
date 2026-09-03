@@ -1,5 +1,6 @@
 mod app_menu;
 mod commands;
+pub mod dns;
 mod find;
 // Shared contract between the app and the `swh_helper` privileged
 // daemon bin target — must be `pub` so `src/bin/swh_helper.rs` can use

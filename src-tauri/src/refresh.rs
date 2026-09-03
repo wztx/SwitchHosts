@@ -158,9 +158,21 @@ async fn refresh_one_inner<R: Runtime>(
         Some(u) if !u.is_empty() => u.to_string(),
         _ => return Err(RefreshError::NoUrl),
     };
+    let source = snapshot
+        .get("source")
+        .and_then(Value::as_str)
+        .unwrap_or("url")
+        .to_string();
 
     // Step 2: fetch the new content. May take seconds; lockless.
-    let new_content = fetch_remote(&url, state).await?;
+    // Domain-sourced nodes resolve via the configured DoH provider
+    // instead of an HTTP fetch; everything downstream (write, stamp,
+    // events) is shared with the URL path.
+    let new_content = if source == "domain" {
+        resolve_domain_content(state, &url).await?
+    } else {
+        fetch_remote(&url, state).await?
+    };
 
     // Step 3: compare with the entries file (always LF on disk). The
     // remote payload may use CRLF, so normalize before comparing —
@@ -346,6 +358,37 @@ fn should_refresh_all_on_startup<R: Runtime>(app: &AppHandle<R>) -> bool {
 
 // ---- fetch -----------------------------------------------------------------
 
+/// Resolve a domain-sourced remote node into hosts content via the
+/// configured DoH provider. Errors keep the previous content on disk
+/// (the caller only writes on success), matching the HTTP path.
+async fn resolve_domain_content(state: &AppState, domain: &str) -> Result<String, RefreshError> {
+    if !crate::dns::is_valid_domain(domain) {
+        return Err(RefreshError::Fetch {
+            message: format!("invalid domain: {domain}"),
+        });
+    }
+    let (provider_id, custom_url) = {
+        let cfg = state.config.lock().expect("config mutex poisoned");
+        (cfg.dns_provider.clone(), cfg.dns_custom_url.clone())
+    };
+    let provider = crate::dns::provider_by_id(&provider_id, &custom_url).map_err(|e| {
+        RefreshError::Fetch {
+            message: e.to_string(),
+        }
+    })?;
+    let client = http::build_client(state).map_err(|message| RefreshError::Fetch { message })?;
+    let ips = crate::dns::resolve_domain(&client, &provider, domain)
+        .await
+        .map_err(|e| RefreshError::Fetch {
+            message: e.to_string(),
+        })?;
+    Ok(crate::dns::build_domain_hosts_content(
+        domain,
+        &ips,
+        &provider.label,
+    ))
+}
+
 async fn fetch_remote(url: &str, state: &AppState) -> Result<String, RefreshError> {
     if let Some(stripped) = url.strip_prefix("file://") {
         return read_file_url(stripped, url);
@@ -442,13 +485,17 @@ fn collect_due_remote_ids(nodes: &[Value], now_ms: i64) -> Vec<String> {
         // https and file. Electron's cron skipped file:// URLs but
         // that was an oversight: local reads are cheap and "auto
         // refresh from a file watched on disk" is a real workflow.
-        let url_ok = node
-            .get("url")
-            .and_then(Value::as_str)
-            .map(|u| {
+        let is_domain = node.get("source").and_then(Value::as_str) == Some("domain");
+        // Domain-sourced nodes carry a bare domain in `url` — accept it
+        // directly; URL-sourced nodes keep the http/https/file scheme
+        // requirement.
+        let url_ok = match node.get("url").and_then(Value::as_str) {
+            Some(u) if is_domain => !u.is_empty(),
+            Some(u) => {
                 u.starts_with("http://") || u.starts_with("https://") || u.starts_with("file://")
-            })
-            .unwrap_or(false);
+            }
+            None => false,
+        };
         if !url_ok {
             return;
         }
@@ -538,6 +585,14 @@ mod tests {
                 "refresh_interval": 60,
                 "last_refresh_ms": 0,
             },
+            {
+                "id": "remote-domain",
+                "type": "remote",
+                "url": "github.com",
+                "source": "domain",
+                "refresh_interval": 60,
+                "last_refresh_ms": 0,
+            },
         ])
         .as_array()
         .cloned()
@@ -595,7 +650,8 @@ mod tests {
                 "remote-2",
                 "remote-no-interval",
                 "remote-bad-scheme",
-                "remote-file"
+                "remote-file",
+                "remote-domain"
             ]
         );
     }
@@ -609,7 +665,25 @@ mod tests {
         // remote-bad-scheme: ftp:// → skip.
         // remote-file: file:// is allowed, last_ms=0 → due.
         let due = collect_due_remote_ids(&tree(), 1_000_000);
-        assert_eq!(due, vec!["remote-1", "remote-2", "remote-file"]);
+        assert_eq!(
+            due,
+            vec!["remote-1", "remote-2", "remote-file", "remote-domain"]
+        );
+    }
+
+    #[test]
+    fn collect_due_ids_domain_source_rules() {
+        // source=domain 且 url 非空 → 即使没有 http(s):// 前缀也算 due
+        let due = collect_due_remote_ids(&tree(), 1_000_000);
+        assert!(due.contains(&"remote-domain".into()));
+
+        // source=domain 但 url 为空 → 不 due
+        let bare = json!([
+            { "id": "d-empty", "type": "remote", "url": "", "source": "domain",
+              "refresh_interval": 60, "last_refresh_ms": 0 }
+        ]);
+        let due2 = collect_due_remote_ids(bare.as_array().unwrap(), 1_000_000);
+        assert!(due2.is_empty());
     }
 
     #[test]

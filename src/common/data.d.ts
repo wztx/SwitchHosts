@@ -10,6 +10,7 @@ export interface IHostsListObject {
   type?: HostsType
 
   // remote
+  source?: 'url' | 'domain' // how `url` is interpreted; missing ⇒ 'url'
   url?: string
   last_refresh?: string
   last_refresh_ms?: number

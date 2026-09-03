@@ -228,11 +228,15 @@ const RightPanel = () => {
 
         {type === 'remote' ? (
           <Stack gap="8px" className={styles.section}>
-            <InfoRow
-              label="URL"
-              value={hosts.url ? <BrowserLink href={hosts.url}>{hosts.url}</BrowserLink> : '—'}
-              mono
-            />
+            {hosts.source === 'domain' ? (
+              <InfoRow label={lang.source_domain} value={hosts.url || '—'} mono />
+            ) : (
+              <InfoRow
+                label="URL"
+                value={hosts.url ? <BrowserLink href={hosts.url}>{hosts.url}</BrowserLink> : '—'}
+                mono
+              />
+            )}
             {inTrashcan ? null : (
               <InfoRow
                 label={lang.auto_refresh}
