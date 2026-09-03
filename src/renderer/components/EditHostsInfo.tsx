@@ -85,11 +85,24 @@ const EditHostsInfo = () => {
     } else if (data && data.id) {
       const h: IHostsListObject | undefined = hostsFn.findItemById(hostsData.list, data.id)
       if (h) {
+        const prevSource = h.source || 'url'
+        const prevUrl = h.url || ''
         Object.assign(h, data)
         await setList([...hostsData.list])
 
         if (data.id === currentHosts?.id) {
           setCurrentHosts(h)
+        }
+
+        // Switching to (or retargeting) a domain source leaves the old
+        // content on disk until the next scheduled refresh; kick one off
+        // now so the entry reflects the new domain immediately.
+        if (
+          data.type === 'remote' &&
+          (data.source as string) === 'domain' &&
+          (prevSource !== 'domain' || prevUrl !== data.url)
+        ) {
+          actions.refreshHosts(h.id).catch((e) => console.error(e))
         }
       } else {
         setIsAdd(true)

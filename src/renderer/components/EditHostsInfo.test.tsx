@@ -192,4 +192,35 @@ describe('EditHostsInfo domain source', () => {
     const saved = mocks.setList.mock.calls[0][0] as any[]
     expect(saved[0].url).toBe('dblp.org')
   })
+
+  it('does not refresh when a domain item is saved unchanged', async () => {
+    mocks.hostsData.list = [
+      { id: 'd1', type: 'remote', source: 'domain', title: 'GH', url: 'github.com' },
+    ]
+    openDialog(mocks.hostsData.list[0])
+    await screen.findByText(/Will be resolved/i)
+    fireEvent.click(screen.getByRole('button', { name: 'OK' }))
+    await waitFor(() => {
+      expect(mocks.setList).toHaveBeenCalled()
+    })
+    expect(mocks.actions.refreshHosts).not.toHaveBeenCalled()
+  })
+
+  it('refreshes when an existing item is retargeted to a domain', async () => {
+    mocks.hostsData.list = [
+      { id: 'u1', type: 'remote', title: 'Sub', url: 'https://example.com/hosts' },
+    ]
+    openDialog(mocks.hostsData.list[0])
+    await screen.findByDisplayValue('https://example.com/hosts')
+    fireEvent.click(screen.getByRole('radio', { name: 'Domain' }))
+    await screen.findByText(/Will be resolved/i)
+    fireEvent.click(screen.getByRole('button', { name: 'OK' }))
+    await waitFor(() => {
+      expect(mocks.setList).toHaveBeenCalled()
+    })
+    const saved = mocks.setList.mock.calls[0][0] as any[]
+    expect(saved[0].source).toBe('domain')
+    expect(saved[0].url).toBe('example.com')
+    expect(mocks.actions.refreshHosts).toHaveBeenCalledWith('u1')
+  })
 })
